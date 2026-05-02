@@ -1,32 +1,46 @@
 ---
 name: vrchat-udonsharp skill concurrency convention
-description: How to safely modify the vrchat-udonsharp skill when other Claude threads might be editing it concurrently
+description: How concurrent edits to the shared vrchat-udonsharp skill are gated — permissions.ask in global settings + git-immediate-commit discipline
 type: reference
 ---
 
 The `vrchat-udonsharp` skill at `C:\Users\progr\.claude\skills\vrchat-udonsharp\` is junctioned into `D:\J\Work\Dev\Claude\claude-skills\vrchat-udonsharp\` — its own git repo — and is shared across all of the user's VRChat projects. Multiple Claude threads (across projects) may be reading or modifying it at the same time. The harness occasionally crashes mid-edit, so any locking scheme has to be **stale-lock-tolerant**.
 
-## Convention
+## Setup: human-as-throttle via permissions.ask
 
-**Reads** are unrestricted — concurrent readers don't conflict on Windows filesystem.
+`~/.claude/settings.json` (global, applies cross-project) has a `permissions.ask` rule that gates `Edit` and `Write` on both the junction path and the canonical path under `claude-skills/`. Effect: every Edit/Write call into the skill triggers a Claude Code permission prompt. The user becomes the natural serialization point — if two threads race, the user can defer one until the other completes (or has been read-back to verify).
 
-**Writes** use git as the coordination point (no sidecar lock files → no stale-lock cleanup needed if a thread dies):
+**Why this design (over a sidecar lock or a hook):**
+- No `.lock` files → impossible to leak a stale lock if the harness crashes mid-edit. Any lock-based scheme would need timeout/heartbeat logic the user wants to avoid.
+- Plain `permissions.ask` works in the desktop app (which is what the user runs); hooks would also work but `permissions.ask` is simpler and the user accepted "ask" as the friction level.
+- Hooks could potentially suppress the "Yes, don't ask again" button (docs unclear), but `permissions.ask` cannot — see caveat below.
 
-1. Before edit: `git -C <skill-repo> status` should show a clean tree (or only your own in-progress changes from this thread). If another thread has uncommitted changes, that's a sign of a racing edit — pause and re-check or surface to the user.
-2. Make the edit.
-3. Immediately commit: `git -C <skill-repo> add <files>` + `git -C <skill-repo> commit -m "..."`. Small focused commits are easier to bisect/revert than batched ones.
-4. If `git commit` fails because another thread committed first, the working tree may need a pull/merge or rebase — re-read the file and re-apply the edit on top of the latest content.
+## ⚠ Caveat: "Yes, don't ask again" button
 
-## Why this approach
+The standard `permissions.ask` prompt UI includes a "Yes, don't ask again" / "always allow" button. If clicked, the rule is bypassed for the rest of the session and the safety is gone. **Never click it for these patterns.** If you do by accident: edit `~/.claude/settings.json` (or the session's local override) to restore the rule, or just restart the session.
 
-- **No sidecar lock files** → impossible to leave a stale lock if Claude's harness crashes mid-edit.
-- **Git already tracks atomic content commits**, with built-in conflict detection if two threads race to modify the same hunk.
-- **Trivial recovery**: if a thread dies between steps 2 and 3, the working tree just has uncommitted changes — visible on next `git status`, easy to inspect and either commit or discard.
+If this becomes a real risk, swap to a `PreToolUse` hook that returns `permissionDecision: "ask"` — hooks fire on every invocation regardless of past approvals (cannot be "always allowed" past).
 
-## What NOT to do
+## ⚠ Caveat: Bash bypasses these rules
 
-- Don't introduce `.lock` files or `flock`-based schemes. They will leak when the harness dies.
-- Don't batch many edits into one commit; that increases the window where two threads can race.
-- Don't rely on filesystem mtime for "did someone else change this?" — git diff is more reliable.
+The rules gate `Edit` and `Write` only. Bash commands (`cp`, `sed`, `tee`, `git checkout`, etc.) running on the skill files would NOT trigger the prompt. Convention: **always edit the skill via the `Edit` tool**, never via Bash. If a multi-file refactor of the skill is ever needed, surface that to the user explicitly so they can serialize manually.
 
-**How to apply:** Before any edit to `SKILL.md` (or any file under `claude-skills/`), check `git status` in that repo, do the edit, commit immediately. If you find pre-existing uncommitted changes you didn't author, treat that as a possible concurrent edit — read the diff, decide if it's compatible, and surface to the user if uncertain.
+## Edit protocol (when modifying the skill)
+
+For every edit:
+
+1. `git -C "D:/J/Work/Dev/Claude/claude-skills" status` — verify clean tree (or only your own staged work). If another thread has uncommitted changes you didn't author, stop and surface to the user — possible concurrent edit.
+2. `Read` the file to get the freshest content (don't rely on a snapshot from earlier in the conversation).
+3. `Edit` the file. The user gets prompted; on approval, the edit lands.
+4. **Immediately** commit: `git -C "D:/J/Work/Dev/Claude/claude-skills" add <files>` + `git -C "D:/J/Work/Dev/Claude/claude-skills" commit -m "..."`. Small, focused commits — easier to bisect / revert.
+5. If your commit fails because another thread committed first, re-read the file, re-apply the edit on top, commit again.
+
+**Why "immediately" commit:** the window between Edit and commit is the race-prone region. Keep it small. The commit is essentially journaling — it doesn't need a separate prompt.
+
+## Files location reminder
+
+- Junction (use this path in tool calls — what other parts of memory point at): `C:\Users\progr\.claude\skills\vrchat-udonsharp\SKILL.md`
+- Canonical / git-tracked: `D:\J\Work\Dev\Claude\claude-skills\vrchat-udonsharp\SKILL.md`
+- Both `Edit` patterns are in the ask rules so either path triggers the prompt.
+
+**How to apply:** When the user asks you to update the skill, follow the Edit protocol above. Expect (and surface to the user) the permission prompt — that's the throttle, not a bug.
