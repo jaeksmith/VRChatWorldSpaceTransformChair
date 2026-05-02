@@ -1,0 +1,7 @@
+- [User profile](user_profile.md) — VRChat/UdonSharp dev, multi-project, prefers terse + autonomous flow; maintains the vrchat-udonsharp skill
+- [Project overview](project_overview.md) — **COMPONENT, not a full world** — chair-derived UdonSharp behaviour for drop-in reuse; API/prefab stability is first-class
+- [Project layout](project_layout.md) — `Unity/VRChatWorldSpaceTransformChair/Assets/Local/` for our authored content; everything else is vendored
+- [Unity path link](reference_unity_path_link.md) — Unity dir is junctioned at `L:\VRChatWorldSpaceTransformChair__Unity\` to dodge MAX_PATH; `Application.dataPath` reflects whichever path was opened
+- [Memory junction setup](reference_memory_junction.md) — `.claude/memory/` is the source of truth; `~/.claude/projects/<encoded>/memory` junctions TO the repo
+- [Skill concurrency convention](reference_skill_concurrency.md) — modify `vrchat-udonsharp` skill via git (status → edit → commit immediately); no sidecar locks, crash-tolerant
+- [Run-state notes](reference_runstate_notes.md) — crash-recovery scratchpad at `.claude/transient/runstate.md` (gitignored); update at checkpoints, not every turn
