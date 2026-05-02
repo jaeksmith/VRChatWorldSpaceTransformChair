@@ -3,5 +3,5 @@
 - [Project layout](project_layout.md) — `Unity/VRChatWorldSpaceTransformChair/Assets/Local/` for our authored content; everything else is vendored
 - [Unity path link](reference_unity_path_link.md) — Unity dir is junctioned at `L:\VRChatWorldSpaceTransformChair__Unity\` to dodge MAX_PATH; `Application.dataPath` reflects whichever path was opened
 - [Memory junction setup](reference_memory_junction.md) — `.claude/memory/` is the source of truth; `~/.claude/projects/<encoded>/memory` junctions TO the repo
-- [Skill concurrency convention](reference_skill_concurrency.md) — `permissions.ask` in `~/.claude/settings.json` gates Edit/Write on the skill paths; user-as-throttle. ⚠ never click "don't ask again". Edit → immediately commit. Bash bypasses the rule
+- [Skill concurrency convention](reference_skill_concurrency.md) — edits to `claude-skills/` go through `python skill_edit.py` (OS file lock, atomic write, auto-commit). Direct Edit/Write are **denied** in `~/.claude/settings.json`. Crash-tolerant; no fat-finger override exists
 - [Run-state notes](reference_runstate_notes.md) — crash-recovery scratchpad at `.claude/transient/runstate.md` (gitignored); update at checkpoints, not every turn

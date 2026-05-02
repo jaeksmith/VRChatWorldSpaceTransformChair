@@ -1,46 +1,78 @@
 ---
 name: vrchat-udonsharp skill concurrency convention
-description: How concurrent edits to the shared vrchat-udonsharp skill are gated — permissions.ask in global settings + git-immediate-commit discipline
+description: Concurrent edits to the shared claude-skills repo are serialized via skill_edit.py (OS file lock); direct Edit/Write are denied
 type: reference
 ---
 
-The `vrchat-udonsharp` skill at `C:\Users\progr\.claude\skills\vrchat-udonsharp\` is junctioned into `D:\J\Work\Dev\Claude\claude-skills\vrchat-udonsharp\` — its own git repo — and is shared across all of the user's VRChat projects. Multiple Claude threads (across projects) may be reading or modifying it at the same time. The harness occasionally crashes mid-edit, so any locking scheme has to be **stale-lock-tolerant**.
+The `vrchat-udonsharp` skill at `C:\Users\progr\.claude\skills\vrchat-udonsharp\` is junctioned into `D:\J\Work\Dev\Claude\claude-skills\` — its own git repo — and is shared across all of the user's VRChat projects. Multiple Claude threads (across projects) may try to edit it at the same time. The harness occasionally crashes mid-edit, so the locking scheme has to be **stale-lock-tolerant**.
 
-## Setup: human-as-throttle via permissions.ask
+## Mechanism: OS-level file lock via `skill_edit.py`
 
-`~/.claude/settings.json` (global, applies cross-project) has a `permissions.ask` rule that gates `Edit` and `Write` on both the junction path and the canonical path under `claude-skills/`. Effect: every Edit/Write call into the skill triggers a Claude Code permission prompt. The user becomes the natural serialization point — if two threads race, the user can defer one until the other completes (or has been read-back to verify).
+A wrapper script at `D:\J\Work\Dev\Claude\claude-skills\skill_edit.py` (committed in the repo) holds an exclusive OS lock on `<repo>/.write.lock` for the full read-edit-write-commit cycle. The OS releases the lock when the process exits — **including on crash** — so there is no sidecar lock file to clean up.
 
-**Why this design (over a sidecar lock or a hook):**
-- No `.lock` files → impossible to leak a stale lock if the harness crashes mid-edit. Any lock-based scheme would need timeout/heartbeat logic the user wants to avoid.
-- Plain `permissions.ask` works in the desktop app (which is what the user runs); hooks would also work but `permissions.ask` is simpler and the user accepted "ask" as the friction level.
-- Hooks could potentially suppress the "Yes, don't ask again" button (docs unclear), but `permissions.ask` cannot — see caveat below.
+Inside the lock the script:
+1. Verifies the working tree is clean (otherwise refuses — orphan changes from a prior crashed thread need human review).
+2. Applies the requested ops (replace / replace_all / append / write / create / delete) using atomic per-file writes (`tempfile` + `os.replace`).
+3. Runs `git add` + `git commit` with the supplied message.
+4. Releases the lock by closing the lock fd (or the OS does it on crash).
 
-## ⚠ Caveat: "Yes, don't ask again" button
+## The deny rule that enforces this
 
-The standard `permissions.ask` prompt UI includes a "Yes, don't ask again" / "always allow" button. If clicked, the rule is bypassed for the rest of the session and the safety is gone. **Never click it for these patterns.** If you do by accident: edit `~/.claude/settings.json` (or the session's local override) to restore the rule, or just restart the session.
+`~/.claude/settings.json` has `permissions.deny` rules covering both the junction path and the canonical clone path, in three forms each (POSIX `//d/...`, Windows-forward `D:/...`, Windows-backslash `D:\...`) for `Edit` and `Write`. With `deny` (not `ask`):
+- Any direct `Edit`/`Write` tool call against the skill paths fails outright.
+- There is **no** "yes, don't ask again" button to fat-finger — the rule cannot be bypassed in the UI.
+- The only allowed channel is `python skill_edit.py` via Bash.
 
-If this becomes a real risk, swap to a `PreToolUse` hook that returns `permissionDecision: "ask"` — hooks fire on every invocation regardless of past approvals (cannot be "always allowed" past).
+## How to invoke (cookbook)
 
-## ⚠ Caveat: Bash bypasses these rules
+Single-op shorthand, JSON via Bash heredoc:
 
-The rules gate `Edit` and `Write` only. Bash commands (`cp`, `sed`, `tee`, `git checkout`, etc.) running on the skill files would NOT trigger the prompt. Convention: **always edit the skill via the `Edit` tool**, never via Bash. If a multi-file refactor of the skill is ever needed, surface that to the user explicitly so they can serialize manually.
+```bash
+python "D:/J/Work/Dev/Claude/claude-skills/skill_edit.py" <<'OPS'
+{
+  "mode": "replace",
+  "file": "D:/J/Work/Dev/Claude/claude-skills/vrchat-udonsharp/SKILL.md",
+  "old": "<exact existing text>",
+  "new": "<replacement text>",
+  "commit_message": "vrchat-udonsharp: <what + why>"
+}
+OPS
+```
 
-## Edit protocol (when modifying the skill)
+If the JSON would contain backticks, embedded `<<EOF` markers, or other characters that fight with shell heredoc rules, write the JSON to a file via the `Write` tool first and pipe it:
 
-For every edit:
+```bash
+python "D:/J/Work/Dev/Claude/claude-skills/skill_edit.py" \
+  < ".claude/transient/skill_edit_input.json"
+```
 
-1. `git -C "D:/J/Work/Dev/Claude/claude-skills" status` — verify clean tree (or only your own staged work). If another thread has uncommitted changes you didn't author, stop and surface to the user — possible concurrent edit.
-2. `Read` the file to get the freshest content (don't rely on a snapshot from earlier in the conversation).
-3. `Edit` the file. The user gets prompted; on approval, the edit lands.
-4. **Immediately** commit: `git -C "D:/J/Work/Dev/Claude/claude-skills" add <files>` + `git -C "D:/J/Work/Dev/Claude/claude-skills" commit -m "..."`. Small, focused commits — easier to bisect / revert.
-5. If your commit fails because another thread committed first, re-read the file, re-apply the edit on top, commit again.
+Batch mode for multi-file or multi-op changes in one commit:
 
-**Why "immediately" commit:** the window between Edit and commit is the race-prone region. Keep it small. The commit is essentially journaling — it doesn't need a separate prompt.
+```json
+{
+  "ops": [
+    {"mode": "replace", "file": "...", "old": "...", "new": "..."},
+    {"mode": "append",  "file": "...", "content": "..."}
+  ],
+  "commit_message": "..."
+}
+```
 
-## Files location reminder
+## Edge cases / failure modes
 
-- Junction (use this path in tool calls — what other parts of memory point at): `C:\Users\progr\.claude\skills\vrchat-udonsharp\SKILL.md`
-- Canonical / git-tracked: `D:\J\Work\Dev\Claude\claude-skills\vrchat-udonsharp\SKILL.md`
-- Both `Edit` patterns are in the ask rules so either path triggers the prompt.
+- **Dirty tree on entry**: script bails with a "resolve first" message. Inspect with `git -C "D:/J/Work/Dev/Claude/claude-skills" status` / `diff` and either commit the orphan work (if it looks complete and well-formed — quite possibly real content from a crashed thread) or `git restore` to discard. Then re-run.
+- **`old` not unique** (in `replace` mode): script bails with the match count. Use a longer surrounding context to make `old` unique, or switch to `replace_all` if all matches genuinely need replacing.
+- **Concurrent thread holds the lock**: this script blocks at lock acquire (default 180-second timeout). The other thread wraps up, commits, releases; this thread proceeds.
+- **Editing `skill_edit.py` itself**: invoke the script on itself with `mode: "write"` and full new content. The deny rule blocks the `Edit` tool from touching it.
+- **Bash shortcuts** (`echo > file`, `sed -i`, etc.) bypass both the deny rule AND the lock. **Don't use them.** No technical safeguard catches it; the convention has to hold.
 
-**How to apply:** When the user asks you to update the skill, follow the Edit protocol above. Expect (and surface to the user) the permission prompt — that's the throttle, not a bug.
+## Background — why not the simpler approaches
+
+Considered and rejected:
+- `permissions.ask` — has a "yes, don't ask again" UI button that can be fat-fingered, removing the safety. Not a real serialization mechanism.
+- Sidecar `.lock` files with PID/timestamp staleness checks — leak when the harness crashes; complex to make right; OS-level locks give all of this for free.
+- Git as the coordination point alone — `git commit` is journaling, not serialization. Disjoint Edits work; same-region Edits / `Write`-tool overwrites can clobber.
+
+The OS-level file lock + atomic file replace + dirty-tree precondition is the smallest mechanism that actually serializes concurrent threads without leaving stale state on crash.
+
+**How to apply:** Whenever the user asks you to update the `vrchat-udonsharp` skill (or any other skill in `claude-skills/`), use `skill_edit.py` via Bash. Do not use the `Edit` or `Write` tool directly — those calls will be denied at the harness level. If you do attempt it and get denied, that's the safety net working; switch to the script.
