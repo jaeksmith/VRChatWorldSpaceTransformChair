@@ -1,6 +1,7 @@
 using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
+using VRC.Udon;
 using VRC.Udon.Common;
 using VRCStation = VRC.SDK3.Components.VRCStation;
 
@@ -31,6 +32,38 @@ using VRCStation = VRC.SDK3.Components.VRCStation;
 //
 // On a change in WHICH hands are gripping (none -> any, single -> two, two -> single, single L
 // <-> single R), we re-snapshot anchors so the transition is jump-free.
+//
+// SCALING — clamp layers. Read once; this got confused early in the project's life.
+//
+//   `SetAvatarEyeHeightByMeters(float)` — what we use to drive scale — has no effective numeric
+//   bounds at the API surface. Per VRChat docs and community testing: absolute range roughly
+//   [0.01, 10000]m, "safe" rendering range [0.1, 100]m. Outside the safe range you may get
+//   visual rendering issues (avatar mesh visually plateaus, IK breaks), but the API itself
+//   accepts the call.
+//
+//   The `SetAvatarEyeHeightMinimumByMeters` / `MaximumByMeters` family is a SEPARATE concern:
+//   it sets the bounds of the radial-puppet UI (player-controlled scaling). The PARAMETER you
+//   pass to those setters is clamped to [0.2, 5]. Those bounds DO NOT constrain
+//   `SetAvatarEyeHeightByMeters` — confirmed against current docs. This script widens them to
+//   the API max [0.2, 5] on station entry as a defensive belt-and-braces (and disables the
+//   manual radial puppet entirely with `SetManualAvatarScalingAllowed(false)` so the puppet
+//   doesn't fight the script during the seated session). On station exit, both are restored.
+//
+//   So the practical clamps the user actually experiences:
+//     A) THIS SCRIPT'S CLAMP — bounds we ASK for in SolveTwoHand:
+//        `_effectiveMinEyeHeight` / `_effectiveMaxEyeHeight`, resolved at station entry from:
+//          - `avatarScalingSettings` UB if wired (its `minimumHeight` / `maximumHeight`), or
+//          - Fallback `baseline * minScale` / `baseline * maxScale`.
+//        HUD shows this as `Clamp: [...]` with the source label.
+//     B) WORLD `AvatarScalingSettings` UB — if present in scene, listens on
+//        `OnAvatarEyeHeightChanged` and re-clamps any eye-height change to its bounds. This is
+//        the final word. Wiring it into our `avatarScalingSettings` field makes A == B so they
+//        don't fight, and the user only has one knob to tune.
+//
+//   If the avatar appears to stop scaling at some value, check the HUD's `Eye height:` line —
+//   if the number keeps dropping but the avatar mesh visually plateaus, it's the avatar's
+//   rendering / IK clamping, not an API clamp. Reduce `minimumHeight` on AvatarScalingSettings
+//   (or the script's `minScale`) only as far as the rendering still looks coherent.
 public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 {
     [Header("Wiring")]
@@ -40,17 +73,30 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     [Tooltip("Transform that gets translated and rotated to move the seated player. Usually the prefab root, or whatever ancestor of the Station that you want to slide around. The Station and its entry/exit point should be descendants of this transform.")]
     public Transform chairTransform;
 
+    [Tooltip("Optional Collider for the Interact zone (the trigger you click to sit). If wired, the script disables the collider when the player sits and re-enables it on exit, so the chair doesn't show the Interact-hover highlight while you're seated and small inside it.")]
+    public Collider interactCollider;
+
     [Header("Limits")]
-    [Tooltip("Minimum avatar scale relative to the player's eye height on station entry. Hard-clamps so the player can't end up microscopic.")]
+    [Tooltip("Optional reference to the scene's AvatarScalingSettings UdonBehaviour (the SDK sample, or any compatible UB exposing `minimumHeight` / `maximumHeight` floats). If wired, the script reads those values on station entry and uses them as the clamp bounds — single source of truth, no duplication. If null, falls back to minScale/maxScale below (relative to player's entry eye height).")]
+    public UdonBehaviour avatarScalingSettings;
+
+    [Tooltip("Fallback minimum avatar scale RELATIVE to the player's eye height on entry, used only when avatarScalingSettings is not wired. 0.1 = 10% of baseline.")]
     public float minScale = 0.1f;
 
-    [Tooltip("Maximum avatar scale relative to the player's eye height on station entry.")]
+    [Tooltip("Fallback maximum avatar scale relative to the player's eye height on entry, used only when avatarScalingSettings is not wired.")]
     public float maxScale = 10.0f;
 
     [Header("Smoothing")]
     [Tooltip("Exponential smoothing on hand positions in the solver (0 = raw input, no lag; 0.5 = noticeable lag, smoother; 0.9 = heavy lag, very smooth). Tune up if VR controller jitter is visible during held grips after the math fix.")]
     [Range(0f, 0.95f)]
     public float inputSmoothing = 0.0f;
+
+    [Header("Visualization")]
+    [Tooltip("Optional in-world UI Text that will display current eye height + scale ratio. Wire to a world-space Canvas's Text element. Updated every frame while seated. Leave null to disable.")]
+    public UnityEngine.UI.Text scaleDisplayText;
+
+    [Tooltip("Optional Transform of a HUD panel (e.g. the scale-display Canvas). If wired, the script auto-scales its localScale by the current avatar-scale ratio so the panel stays roughly apparent-constant in the player's view as they scale.")]
+    public Transform scaleDisplayPanelTransform;
 
     private VRCPlayerApi _localPlayer;
     private bool _isSeatedLocal;
@@ -81,6 +127,34 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     private Vector3 _filteredLeftPos, _filteredRightPos;
     private bool _filterPrimed;
 
+    // Effective absolute clamp bounds (meters) — Layer 2 in the SCALING comment block above.
+    // Computed on station entry from either avatarScalingSettings (if wired) or
+    // baseline*minScale/baseline*maxScale (if not). _clampFromWorld records which path resolved
+    // them so the HUD can show the source clearly.
+    private float _effectiveMinEyeHeight;
+    private float _effectiveMaxEyeHeight;
+    private bool _clampFromWorld;
+
+    // Player's prior eye-height-bounds before we widened them on station entry. Restored on exit.
+    // We widen to VRChat's max API range [0.2, 5] so the player-bounds layer doesn't silently
+    // clamp our SetAvatarEyeHeightByMeters calls below 0.5m (a common default min) etc.
+    private float _savedPlayerMinHeight;
+    private float _savedPlayerMaxHeight;
+    private bool _playerBoundsWidened;
+
+    // HUD panel auto-scale base (captured once at start).
+    private Vector3 _hudPanelBaseScale;
+    private bool _hudPanelBaseCaptured;
+
+    private void Start()
+    {
+        if (scaleDisplayPanelTransform != null)
+        {
+            _hudPanelBaseScale = scaleDisplayPanelTransform.localScale;
+            _hudPanelBaseCaptured = true;
+        }
+    }
+
     public override void Interact()
     {
         if (station == null) return;
@@ -103,6 +177,47 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
         // Stop the user's radial-puppet scale from fighting the script while they're seated.
         _localPlayer.SetManualAvatarScalingAllowed(false);
+
+        // Hide the Interact hover-highlight on the chair's trigger collider while seated. When
+        // the player is seated and shrinks, their interact ray often re-hits the trigger from
+        // inside, showing the highlight at random scales. Disabling here suppresses that.
+        if (interactCollider != null) interactCollider.enabled = false;
+
+        // Save the player's existing eye-height bounds, then widen to VRChat's API max range
+        // so the player-level clamp doesn't silently floor our SetAvatarEyeHeightByMeters
+        // calls (e.g. defaults can sit at min=0.5, capping us before our own clamp engages).
+        _savedPlayerMinHeight = _localPlayer.GetAvatarEyeHeightMinimumAsMeters();
+        _savedPlayerMaxHeight = _localPlayer.GetAvatarEyeHeightMaximumAsMeters();
+        _localPlayer.SetAvatarEyeHeightMinimumByMeters(0.2f); // VRChat API floor
+        _localPlayer.SetAvatarEyeHeightMaximumByMeters(5.0f); // VRChat API ceiling
+        _playerBoundsWidened = true;
+
+        // Resolve our effective clamp bounds (Layer 2). If the world has an AvatarScalingSettings
+        // UdonBehaviour and the user wired it into our field, read its minimumHeight /
+        // maximumHeight as the absolute-meter source of truth so layers 2 and 3 agree. Otherwise
+        // fall back to script-relative bounds (baseline * minScale / maxScale).
+        _clampFromWorld = false;
+        if (avatarScalingSettings != null)
+        {
+            object minObj = avatarScalingSettings.GetProgramVariable("minimumHeight");
+            object maxObj = avatarScalingSettings.GetProgramVariable("maximumHeight");
+            if (minObj != null && maxObj != null)
+            {
+                _effectiveMinEyeHeight = (float)minObj;
+                _effectiveMaxEyeHeight = (float)maxObj;
+                _clampFromWorld = true;
+            }
+            else
+            {
+                _effectiveMinEyeHeight = _baselineEyeHeight * minScale;
+                _effectiveMaxEyeHeight = _baselineEyeHeight * maxScale;
+            }
+        }
+        else
+        {
+            _effectiveMinEyeHeight = _baselineEyeHeight * minScale;
+            _effectiveMaxEyeHeight = _baselineEyeHeight * maxScale;
+        }
     }
 
     public override void OnStationExited(VRCPlayerApi player)
@@ -119,7 +234,18 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         {
             _localPlayer.SetAvatarEyeHeightByMeters(_baselineEyeHeight);
             _localPlayer.SetManualAvatarScalingAllowed(true);
+
+            // Restore the player's eye-height bounds we widened on entry.
+            if (_playerBoundsWidened)
+            {
+                _localPlayer.SetAvatarEyeHeightMinimumByMeters(_savedPlayerMinHeight);
+                _localPlayer.SetAvatarEyeHeightMaximumByMeters(_savedPlayerMaxHeight);
+                _playerBoundsWidened = false;
+            }
         }
+
+        // Re-enable the Interact zone so the chair is clickable again.
+        if (interactCollider != null) interactCollider.enabled = true;
     }
 
     public override void InputGrab(bool value, UdonInputEventArgs args)
@@ -138,6 +264,42 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         if (_anchoredLeft || _anchoredRight) return;
         if (_localPlayer == null) _localPlayer = player;
         _baselineEyeHeight = _localPlayer.GetAvatarEyeHeightAsMeters();
+    }
+
+    private void Update()
+    {
+        // Visualization update — independent of solver. Runs whether gripping or not.
+        if (_localPlayer != null && _isSeatedLocal)
+        {
+            float current = _localPlayer.GetAvatarEyeHeightAsMeters();
+            float ratio = (_baselineEyeHeight > 1e-5f) ? (current / _baselineEyeHeight) : 1f;
+
+            if (scaleDisplayText != null)
+            {
+                // 4-line readout. Each line answers a question the user is likely asking:
+                //   "How tall is my avatar right now?"      -> Eye height
+                //   "What was I when I sat down?"           -> Baseline (entry)
+                //   "How small/big am I vs entry?"          -> Scale ratio
+                //   "What's the script's allowed range?"    -> Clamp + source
+                string clampSource = _clampFromWorld ? "AvatarScalingSettings" : "minScale*baseline (fallback)";
+                scaleDisplayText.text =
+                    "Eye height: " + current.ToString("F3") + " m\n" +
+                    "Baseline:   " + _baselineEyeHeight.ToString("F3") + " m  (entry)\n" +
+                    "Ratio:      " + ratio.ToString("F3") + "x\n" +
+                    "Clamp: [" + _effectiveMinEyeHeight.ToString("F3") + ", " + _effectiveMaxEyeHeight.ToString("F3") + "] m\n" +
+                    "  source: " + clampSource;
+            }
+
+            // Auto-scale the HUD panel to keep apparent size roughly constant across player scale.
+            if (scaleDisplayPanelTransform != null && _hudPanelBaseCaptured)
+            {
+                scaleDisplayPanelTransform.localScale = _hudPanelBaseScale * ratio;
+            }
+        }
+        else if (scaleDisplayText != null)
+        {
+            scaleDisplayText.text = "(not seated)";
+        }
     }
 
     private void LateUpdate()
@@ -244,12 +406,12 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         if (currentDist < 1e-5f) return; // hands coincident, solve undefined for this frame
         Vector3 currentAxisN = currentAxis / currentDist;
 
-        // Eye height drives avatar scale. Clamp against the player's initial size, not against
-        // the current size, so re-grips don't accumulate past the limits.
+        // Eye height drives avatar scale. Clamp against the effective bounds resolved on
+        // station entry (from avatarScalingSettings if wired, else baseline*minScale/maxScale).
+        // Clamping against entry bounds rather than current size prevents re-grips from
+        // accumulating past the limits across multiple grip cycles.
         float scaleFactor = _anchorDist / currentDist;
-        float minEyeHeight = _baselineEyeHeight * minScale;
-        float maxEyeHeight = _baselineEyeHeight * maxScale;
-        float eyeHeightTarget = Mathf.Clamp(_eyeHeightAtGrip * scaleFactor, minEyeHeight, maxEyeHeight);
+        float eyeHeightTarget = Mathf.Clamp(_eyeHeightAtGrip * scaleFactor, _effectiveMinEyeHeight, _effectiveMaxEyeHeight);
 
         Quaternion R = Quaternion.FromToRotation(currentAxisN, _anchorAxisN);
 
