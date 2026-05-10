@@ -54,6 +54,11 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         box.size = new Vector3(1f, 1.5f, 1f);
         box.center = new Vector3(0f, 0.75f, 0f);
 
+        // 4. VRCStation. Component is added now; field configuration happens in step 6 once
+        //    the seat / exit transforms exist to wire into stationEnterPlayerLocation /
+        //    stationExitPlayerLocation.
+        var station = Undo.AddComponent<VRC.SDK3.Components.VRCStation>(rootGO);
+
         // 5. Seat (entry point) and Exit (where the player lands on Jump-out).
         var seatGO = new GameObject("Seat");
         Undo.RegisterCreatedObjectUndo(seatGO, "Create Seat Transform");
