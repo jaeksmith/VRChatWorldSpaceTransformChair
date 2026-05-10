@@ -2,8 +2,8 @@
 name: Project overview
 description: VRChatWorldSpaceTransformChair is a reusable VRChat UdonSharp seating component, not a full world
 type: project
+originSessionId: d6951207-22e8-4061-8690-43e2cf33b087
 ---
-
 **Project type: COMPONENT, not a full world.** This distinguishes it from sister projects `VrcBoardBoundTactics` and `PurplePicturePalace`, which are published worlds.
 
 The deliverable is one (or a small set of) UdonSharp script(s) packaged for drop-in reuse in third-party VRChat worlds. The Unity sub-project under `Unity/VRChatWorldSpaceTransformChair/` exists to develop, test, and showcase the component.
@@ -15,4 +15,5 @@ The deliverable is one (or a small set of) UdonSharp script(s) packaged for drop
 - Default to multiplayer-correct designs (UdonSynced where required, master/owner authority patterns) so consumers don't have to retrofit networking.
 - Keep the surface area narrow and well-named; avoid leaking internal-helper behaviours into the component's public scripts folder.
 - The dev scene `Assets/Local/Scenes/DevScene001.unity` is **scaffolding for testing**, not part of the shipped component.
-- The actual purpose of the chair behaviour ("WorldSpaceTransform") is TBD — wait for the user's brief in a follow-up message before committing to a design.
+- **Purpose (resolved):** "grab the world" interaction — seated player rotates / translates / scales their view by gripping with VR controllers. Inspired by Half-Life: Alyx / Demeo. Working as of v1 (single-player) and v2 (multiplayer-synced via VRCPlayerObject). See `project_v2_sync_architecture.md` for the multiplayer architecture and `project_known_issues_v2.md` for current open issues.
+- **Public repo:** github.com/jaeksmith/VRChatWorldSpaceTransformChair (made public 2026-05-10).

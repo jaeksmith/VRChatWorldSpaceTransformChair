@@ -7,3 +7,5 @@
 - [Run-state notes](reference_runstate_notes.md) — crash-recovery scratchpad at `.claude/transient/runstate.md` (gitignored); update at checkpoints, not every turn
 - [Inline small Unity tasks in chat](feedback_small_tasks_in_chat.md) — if the user's next-step list is short, put it in the chat reply, not only in a hand-off doc
 - [V2 multiplayer-sync architecture (verified)](project_v2_sync_architecture.md) — VRCPlayerObject + UdonSynced pose + per-frame stationEnterPlayerLocation drive; verified 2026-05-10 with 3-client Build & Test
+- [Known issues in v2 chair](project_known_issues_v2.md) — open issues post-v2: scale-display lag, HUD scaling, avatar mesh-detach at crossover, body-bork at large scales
+- [Build & Test multi-client workflow](reference_build_test_workflow.md) — user's two-tier test cycle; shared-username caveat for local Build & Test clients
