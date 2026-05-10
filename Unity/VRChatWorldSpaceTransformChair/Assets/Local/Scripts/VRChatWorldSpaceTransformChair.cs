@@ -9,8 +9,18 @@ using VRCStation = VRC.SDK3.Components.VRCStation;
 //
 // While seated in the VRCStation, a VR player can hold one or both grips and translate / rotate
 // (and, with both, scale) the world by moving their hands. Implemented by transforming the chair
-// (which moves the seated player) and the avatar's eye height (which sets player size). v1 is
-// local-only and not networked.
+// (which moves the seated player) and the avatar's eye height (which sets player size).
+//
+// MULTIPLAYER: The chair root carries a `VRC.SDK3.Components.VRCPlayerObject` so VRChat
+// auto-spawns one copy per joining player, with that player as owner. Each player sits in
+// their own chair (Interact gated on `Networking.IsOwner(gameObject)`). Owner writes
+// chairTransform pose into [UdonSynced] fields after solving, throttled to ~10Hz max during
+// motion and 0Hz when the chair is parked (no bandwidth while sitting still). Remote viewers
+// lerp their local chairTransform toward the synced pose each frame; the station is in
+// Immobilize mode so the seated remote avatar follows stationEnterPlayerLocation, giving
+// remote-rendered seated players the correct world pose including full 3D rotation
+// (the desync-station pattern; rotation is NOT yaw-clamped like TeleportTo).
+// Avatar scale auto-syncs via standard player networking — no extra work needed.
 //
 // Solver, both modes, snapshot at grip start, then per frame find the transform T that maps
 // current hand pose back to anchor hand pose, apply T to:
@@ -64,6 +74,7 @@ using VRCStation = VRC.SDK3.Components.VRCStation;
 //   if the number keeps dropping but the avatar mesh visually plateaus, it's the avatar's
 //   rendering / IK clamping, not an API clamp. Reduce `minimumHeight` on AvatarScalingSettings
 //   (or the script's `minScale`) only as far as the rendering still looks coherent.
+[UdonBehaviourSyncMode(BehaviourSyncMode.Manual)]
 public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 {
     [Header("Wiring")]
@@ -97,6 +108,27 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
     [Tooltip("Optional Transform of a HUD panel (e.g. the scale-display Canvas). If wired, the script auto-scales its localScale by the current avatar-scale ratio so the panel stays roughly apparent-constant in the player's view as they scale.")]
     public Transform scaleDisplayPanelTransform;
+
+    [Header("Multiplayer sync")]
+    [Tooltip("Maximum RequestSerialization rate (per second) while the chair is moving. Owner-side throttle; remote viewers lerp between received values for visual smoothness. ~10 is fine for typical use; raise for snappier remote rendering at the cost of bandwidth.")]
+    public float activeUpdatesPerSecond = 10f;
+
+    [Tooltip("Position-change threshold (meters) below which the chair counts as 'idle' for serialization purposes — no further serializes until the chair moves more than this from the last serialized value. Bounds steady-state cumulative drift to this magnitude. ~0.001 = 1mm is invisible.")]
+    public float idlePosThreshold = 0.001f;
+
+    [Tooltip("Rotation-change threshold (degrees) below which the chair counts as 'idle' (see idlePosThreshold). ~0.1 = a tenth of a degree.")]
+    public float idleRotThreshold = 0.1f;
+
+    [Tooltip("Per-frame lerp factor for remote viewers smoothing toward the synced chair pose (0 = no movement, 1 = snap). 0.2 was visually smooth at ~10Hz updates in 3-client testing.")]
+    [Range(0.05f, 1f)]
+    public float remoteLerp = 0.2f;
+
+    [Header("Per-player layout")]
+    [Tooltip("X-axis spawn offset per player ID, in meters. When this script is on a VRCPlayerObject template, all per-player copies spawn at the same template position; offsetting by playerId * this value spreads chairs along X so click-targets and visuals don't overlap. Computed deterministically on every client (no sync). Set to 0 if your world places chairs explicitly via some other mechanism.")]
+    public float perPlayerXSpacing = 1.5f;
+
+    [UdonSynced] private Vector3 _syncedChairPos;
+    [UdonSynced] private Quaternion _syncedChairRot;
 
     private VRCPlayerApi _localPlayer;
     private bool _isSeatedLocal;
@@ -146,12 +178,44 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     private Vector3 _hudPanelBaseScale;
     private bool _hudPanelBaseCaptured;
 
+    // Sync state — only meaningful on the owner.
+    private Vector3 _lastSerializedPos;
+    private Quaternion _lastSerializedRot;
+    private float _lastSerializeTime;
+
+    // Per-player offset is applied once per instance (every client computes the same
+    // value from owner.playerId, so this is local-only state).
+    private bool _perPlayerOffsetApplied;
+
     private void Start()
     {
         if (scaleDisplayPanelTransform != null)
         {
             _hudPanelBaseScale = scaleDisplayPanelTransform.localScale;
             _hudPanelBaseCaptured = true;
+        }
+
+        // Apply the per-player root offset early so the synced-pose seed below is at
+        // the correct location. Owner is normally known by Start for VRCPlayerObject
+        // copies; if not, LateUpdate retries until it lands.
+        ApplyPerPlayerOffsetIfNeeded();
+
+        // Seed synced fields so remote viewers don't lerp toward (0,0,0) before the
+        // owner's first serialize lands. After Start, all clients hold the chair at
+        // its post-offset position and lerp from there.
+        if (chairTransform != null)
+        {
+            _syncedChairPos = chairTransform.position;
+            _syncedChairRot = chairTransform.rotation;
+            _lastSerializedPos = _syncedChairPos;
+            _lastSerializedRot = _syncedChairRot;
+        }
+
+        // Hide the HUD panel on remote viewers. Each player only cares about their own
+        // scale data; N panels in the world is visual noise. Owners keep it.
+        if (scaleDisplayPanelTransform != null && !Networking.IsOwner(gameObject))
+        {
+            scaleDisplayPanelTransform.gameObject.SetActive(false);
         }
     }
 
@@ -160,7 +224,36 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         if (station == null) return;
         VRCPlayerApi p = Networking.LocalPlayer;
         if (p == null) return;
+
+        // Per-player chair: only the owner sits in their own. For VRCPlayerObject
+        // instances ownership is fixed by VRChat — the SetOwner call below no-ops
+        // for non-owners and IsOwner stays false. For a non-PlayerObject scene
+        // chair (single-chair fallback), ownership starts with the master and
+        // SetOwner grabs it on first Interact, then the gate passes.
+        if (!Networking.IsOwner(gameObject))
+        {
+            Networking.SetOwner(p, gameObject);
+            if (!Networking.IsOwner(gameObject)) return;
+        }
+
         station.UseStation(p);
+    }
+
+    public override void OnPlayerJoined(VRCPlayerApi player)
+    {
+        // Late-joiner refresh — push a serialize so the new player gets current state
+        // immediately rather than waiting for the next motion-driven serialize. (UdonSynced
+        // also sends initial state to joiners natively, but this is cheap belt-and-braces.)
+        if (player == null || player.isLocal) return;
+        if (!Networking.IsOwner(gameObject)) return;
+        if (chairTransform == null) return;
+
+        _syncedChairPos = chairTransform.position;
+        _syncedChairRot = chairTransform.rotation;
+        _lastSerializedPos = _syncedChairPos;
+        _lastSerializedRot = _syncedChairRot;
+        _lastSerializeTime = Time.time;
+        RequestSerialization();
     }
 
     public override void OnStationEntered(VRCPlayerApi player)
@@ -304,22 +397,100 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
     private void LateUpdate()
     {
-        if (!_isSeatedLocal || _localPlayer == null) return;
-        if (!_localPlayer.IsUserInVR()) return;
+        // Lazy retry of the per-player offset in case Start ran before owner was assigned.
+        ApplyPerPlayerOffsetIfNeeded();
 
-        bool wantGrip = _leftGrip || _rightGrip;
-        bool gripSetChanged = (_leftGrip != _anchoredLeft) || (_rightGrip != _anchoredRight);
+        bool isOwner = Networking.IsOwner(gameObject);
 
-        if (wantGrip && gripSetChanged)
+        if (!isOwner)
         {
-            SnapshotAnchors();
+            // Remote viewer: lerp the local chairTransform toward the synced pose.
+            // The station is in Immobilize mode, so the seated remote avatar follows
+            // chairTransform's children (in particular stationEnterPlayerLocation),
+            // giving the remote-rendered seated player the correct world pose.
+            if (chairTransform != null)
+            {
+                Vector3 cur = chairTransform.position;
+                Quaternion curR = chairTransform.rotation;
+                chairTransform.SetPositionAndRotation(
+                    Vector3.Lerp(cur, _syncedChairPos, remoteLerp),
+                    Quaternion.Slerp(curR, _syncedChairRot, remoteLerp)
+                );
+            }
+            return;
         }
 
-        _anchoredLeft = _leftGrip;
-        _anchoredRight = _rightGrip;
+        // === Owner path ===
+        // Run the solver only when the local player is seated and in VR. Otherwise the
+        // chair just holds at its current pose — no synced changes either, so remote
+        // viewers see it at rest at the last solved position.
+        if (_isSeatedLocal && _localPlayer != null && _localPlayer.IsUserInVR())
+        {
+            bool wantGrip = _leftGrip || _rightGrip;
+            bool gripSetChanged = (_leftGrip != _anchoredLeft) || (_rightGrip != _anchoredRight);
 
-        if (_anchoredLeft && _anchoredRight) SolveTwoHand();
-        else if (_anchoredLeft || _anchoredRight) SolveOneHand();
+            if (wantGrip && gripSetChanged)
+            {
+                SnapshotAnchors();
+            }
+
+            _anchoredLeft = _leftGrip;
+            _anchoredRight = _rightGrip;
+
+            if (_anchoredLeft && _anchoredRight) SolveTwoHand();
+            else if (_anchoredLeft || _anchoredRight) SolveOneHand();
+        }
+
+        // After the solver may have mutated chairTransform, push the new pose out via
+        // UdonSynced if it actually changed. Motion-gated + rate-throttled — see TrySerialize.
+        TrySerialize();
+    }
+
+    // Apply a one-time per-player X offset to the root transform. Computed deterministically
+    // from owner.playerId so every client agrees on the same offset and we don't have to
+    // sync the root pose itself. Safe to call repeatedly — it self-guards via _perPlayerOffsetApplied.
+    //
+    // Why move the ROOT and not just children: BoxCollider for the Interact zone lives on
+    // the root (in local space). If we moved only the children, all per-player copies'
+    // colliders would stack at the template position — Interact rays then hit an arbitrary
+    // stacked collider regardless of which visible mesh you point at, and the IsOwner gate
+    // no-ops most attempts. Caught by 3-client testing of the V2SyncSpike rig.
+    private void ApplyPerPlayerOffsetIfNeeded()
+    {
+        if (_perPlayerOffsetApplied || perPlayerXSpacing <= 0f) return;
+        VRCPlayerApi owner = Networking.GetOwner(gameObject);
+        if (owner == null) return;
+        transform.position = transform.position + new Vector3(owner.playerId * perPlayerXSpacing, 0f, 0f);
+        _perPlayerOffsetApplied = true;
+    }
+
+    // Owner-side: serialize the chair pose if it's changed enough since last serialize,
+    // subject to a max-rate throttle. Idle (chair pose static within thresholds) means no
+    // serialize at all — bandwidth drops to zero while the player sits in one spot. Late
+    // joiners get the current state via UdonSynced's initial-state delivery; OnPlayerJoined
+    // additionally pushes a fresh serialize to refresh.
+    private void TrySerialize()
+    {
+        if (chairTransform == null) return;
+
+        Vector3 newPos = chairTransform.position;
+        Quaternion newRot = chairTransform.rotation;
+
+        float posDelta = (newPos - _lastSerializedPos).magnitude;
+        float rotDelta = Quaternion.Angle(newRot, _lastSerializedRot);
+        if (posDelta < idlePosThreshold && rotDelta < idleRotThreshold) return;
+
+        float now = Time.time;
+        float dt = now - _lastSerializeTime;
+        float minInterval = 1f / Mathf.Max(0.1f, activeUpdatesPerSecond);
+        if (dt < minInterval) return;
+
+        _syncedChairPos = newPos;
+        _syncedChairRot = newRot;
+        _lastSerializedPos = newPos;
+        _lastSerializedRot = newRot;
+        _lastSerializeTime = now;
+        RequestSerialization();
     }
 
     private void SnapshotAnchors()

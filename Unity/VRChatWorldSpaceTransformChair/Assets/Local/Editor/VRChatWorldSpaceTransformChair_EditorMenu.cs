@@ -10,10 +10,11 @@ using UnityEngine.UI;
 // existing GameObject in the scene/prefab. If you have a working chair you want to preserve,
 // it is left strictly alone.
 //
-// The single menu builds a complete fresh chair instance in the scene, with VRCStation,
-// trigger collider, Seat/Exit transforms, the UdonSharpBehaviour, the scale display HUD, and
-// auto-wired serialized fields. The resulting GameObject can be dragged into a Prefabs folder
-// to make it a prefab.
+// The single menu builds a complete fresh chair TEMPLATE in the scene, with VRCPlayerObject
+// (so VRChat auto-spawns one per joining player at runtime), VRCStation, trigger collider,
+// Seat/Exit transforms, the UdonSharpBehaviour, the scale display HUD, and auto-wired
+// serialized fields. The resulting GameObject can be dragged into a Prefabs folder to make
+// it a reusable prefab.
 public static class VRChatWorldSpaceTransformChair_EditorMenu
 {
     private const string MenuRoot = "Tools/VRChat World-Space Transform Chair/";
@@ -40,16 +41,20 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         rootT.rotation = Quaternion.identity;
         rootT.localScale = Vector3.one;
 
-        // 2. BoxCollider (trigger) — the Interact zone. Size matches sample VRCChair3.
+        // 2. VRCPlayerObject — auto-spawns one copy per joining player at runtime. The template
+        //    here is disabled at runtime; copies appear at the same parent. NetworkIDs for the
+        //    UdonSynced fields on the chair behaviour are auto-assigned at build time.
+        Undo.AddComponent<VRC.SDK3.Components.VRCPlayerObject>(rootGO);
+
+        // 3. BoxCollider (trigger) — the Interact zone. Size matches sample VRCChair3. Lives on
+        //    the root so per-player offset (which moves the root) keeps the click-target aligned
+        //    with the visible chair.
         var box = Undo.AddComponent<BoxCollider>(rootGO);
         box.isTrigger = true;
         box.size = new Vector3(1f, 1.5f, 1f);
         box.center = new Vector3(0f, 0.75f, 0f);
 
-        // 3. VRCStation. Configured AFTER seat/exit transforms exist so we can wire them.
-        var station = Undo.AddComponent<VRC.SDK3.Components.VRCStation>(rootGO);
-
-        // 4. Seat (entry point) and Exit (where the player lands on Jump-out).
+        // 5. Seat (entry point) and Exit (where the player lands on Jump-out).
         var seatGO = new GameObject("Seat");
         Undo.RegisterCreatedObjectUndo(seatGO, "Create Seat Transform");
         seatGO.transform.SetParent(rootT, worldPositionStays: false);
@@ -62,7 +67,7 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         exitGO.transform.localPosition = new Vector3(0f, 0f, 0.6f);
         exitGO.transform.localRotation = Quaternion.identity;
 
-        // 5. Configure VRCStation. Critical fields:
+        // 6. Configure VRCStation. Critical fields:
         //    - PlayerMobility = Immobilize so locomotion is locked while seated.
         //    - disableStationExit = false so Jump triggers OnStationExited.
         //    - seated = true matches the SDK sample VRCChair3; user can flip to false in
@@ -75,7 +80,7 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         station.stationEnterPlayerLocation = seatGO.transform;
         station.stationExitPlayerLocation = exitGO.transform;
 
-        // 6. Add the UdonSharpBehaviour via UdonSharpUndo.AddComponent — NOT plain AddComponent.
+        // 7. Add the UdonSharpBehaviour via UdonSharpUndo.AddComponent — NOT plain AddComponent.
         //    Plain AddComponent looks like it works but the proxy<->UdonBehaviour link isn't
         //    initialised, and the next CopyProxyToUdon throws ArgumentNullException with a
         //    "Value cannot be null. Parameter name: key" deep in the UdonSharp formatter.
@@ -91,10 +96,10 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
             return;
         }
 
-        // 7. Build the scale display HUD as a child of the chair root.
+        // 8. Build the scale display HUD as a child of the chair root.
         BuildScaleDisplayPanel(rootT, out var panelT, out var textComp);
 
-        // 8. Wire chair fields. Mutate the proxy, then push to UdonBehaviour heap via
+        // 9. Wire chair fields. Mutate the proxy, then push to UdonBehaviour heap via
         //    CopyProxyToUdon so values persist into the Udon runtime.
         Undo.RecordObject(chair, "Wire Chair Fields");
         chair.station = station;
@@ -103,9 +108,9 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         chair.scaleDisplayText = textComp;
         chair.scaleDisplayPanelTransform = panelT;
 
-        // 9. Best-effort: find a scene AvatarScalingSettings UB and wire it as the world-clamp
-        //    source. If found, our script will read its minimumHeight/maximumHeight on station
-        //    entry instead of using the relative minScale/maxScale fallback.
+        // 10. Best-effort: find a scene AvatarScalingSettings UB and wire it as the world-clamp
+        //     source. If found, our script will read its minimumHeight/maximumHeight on station
+        //     entry instead of using the relative minScale/maxScale fallback.
         var asUB = FindAvatarScalingSettingsInScene();
         if (asUB != null) chair.avatarScalingSettings = asUB;
 
@@ -119,20 +124,27 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         EditorUtility.DisplayDialog(
             "Create New Chair",
             "Created '" + rootGO.name + "' at " + rootT.position + ".\n\n" +
+            "This is a VRCPlayerObject TEMPLATE — at runtime VRChat disables this GameObject\n" +
+            "and instantiates one copy per joining player, with that player as owner. Each\n" +
+            "player can only sit in their own copy (Interact is gated on IsOwner).\n\n" +
             "Wiring summary:\n" +
+            "  VRCPlayerObject: ✓ (auto-spawn per player)\n" +
             "  station: ✓\n" +
             "  chairTransform: ✓ (root)\n" +
-            "  interactCollider: ✓ (BoxCollider; auto-disabled while seated to suppress Interact-hover highlight)\n" +
+            "  interactCollider: ✓ (BoxCollider; auto-disabled while seated)\n" +
             "  scaleDisplayText: " + (textComp != null ? "✓" : "MISSING") + "\n" +
-            "  scaleDisplayPanelTransform: ✓\n" +
+            "  scaleDisplayPanelTransform: ✓ (auto-hidden on remote viewers)\n" +
             "  avatarScalingSettings: " + (asUB != null
                 ? ("✓ wired to '" + asUB.gameObject.name + "'")
-                : "(none found in scene; left null — script falls back to minScale/maxScale relative bounds)") + "\n\n" +
+                : "(none found in scene; left null — script falls back to minScale/maxScale)") + "\n\n" +
+            "Sync defaults (tunable on the chair Inspector):\n" +
+            "  activeUpdatesPerSecond: 10 (max RequestSerialization rate during motion)\n" +
+            "  idle thresholds: 1mm position / 0.1° rotation (no serialize while parked)\n" +
+            "  remoteLerp: 0.2 (per-frame smoothing for remote viewers)\n" +
+            "  perPlayerXSpacing: 1.5 (per-playerId X offset to spread chairs at spawn)\n\n" +
             "VRCStation defaults:\n" +
-            "  PlayerMobility: Immobilize\n" +
-            "  Disable Station Exit: FALSE (so Jump-to-exit works)\n" +
-            "  seated: TRUE (flip on the VRCStation Inspector to FALSE if you prefer a standing pose)\n\n" +
-            "If this works in VR, drag the GameObject into Assets/Local/Prefabs to make it a prefab.\n\n" +
+            "  PlayerMobility: Immobilize  |  Disable Station Exit: FALSE  |  seated: TRUE\n\n" +
+            "If this works in VR, drag the GameObject into Assets/Local/Prefabs to make it a prefab.\n" +
             "This menu did NOT modify any existing chair or other scene GameObject.",
             "OK");
     }
