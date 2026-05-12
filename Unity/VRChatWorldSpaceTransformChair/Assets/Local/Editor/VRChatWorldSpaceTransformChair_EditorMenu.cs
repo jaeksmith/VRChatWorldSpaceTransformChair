@@ -198,11 +198,15 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
     // instead of under ScaleDisplayPanel. Sidestepped entirely by creating with RectTransform
     // from the start.
     //
-    // Sizing values match an empirically-verified working configuration the user landed on by
-    // hand (Round 5):
-    //   panel: localScale 0.003, sizeDelta 100 x 70 → world footprint ~0.30 x 0.21 m
+    // Sizing values started from an empirically-verified working configuration the user landed
+    // on by hand (Round 5 — 100 x 70), then bumped iteratively to fit added diagnostic lines:
+    //   - +20 height (90) for the Offset line
+    //   - widened 1.7x (170) + +20 height (110) and centered text once the Target line was
+    //     added (7 lines total now, including Target / Eye height / Baseline / Ratio / Clamp /
+    //     source / Offset; long Offset line wraps to ~8 visual lines at 170 wide)
+    //   panel: localScale 0.003, sizeDelta 170 x 110 → world footprint ~0.51 x 0.33 m
     //   CanvasScaler.dynamicPixelsPerUnit 50 (text crispness)
-    //   text: stretch-to-fill, fontSize 12, left-aligned, wrap on (per-line readability)
+    //   text: stretch-to-fill, fontSize 12, center-aligned, wrap on (per-line readability)
     private static void BuildScaleDisplayPanel(Transform parent, out Transform panelT, out Text textComp)
     {
         // Panel root with RectTransform from creation — no Transform swap.
@@ -217,7 +221,7 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         rt.localPosition = new Vector3(0f, 1.4f, 0.7f);
         rt.localRotation = Quaternion.identity;
         rt.localScale = Vector3.one * 0.003f;
-        rt.sizeDelta = new Vector2(100f, 70f);
+        rt.sizeDelta = new Vector2(170f, 110f);
 
         // UI components on the panel.
         var canvas = panelGO.AddComponent<Canvas>();
@@ -236,7 +240,7 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         rt.localPosition = new Vector3(0f, 1.4f, 0.7f);
         rt.localRotation = Quaternion.identity;
         rt.localScale = Vector3.one * 0.003f;
-        rt.sizeDelta = new Vector2(100f, 70f);
+        rt.sizeDelta = new Vector2(170f, 110f);
 
         // Text child — same RectTransform-from-creation pattern.
         var textGO = new GameObject("DisplayText", typeof(RectTransform));
@@ -263,7 +267,7 @@ public static class VRChatWorldSpaceTransformChair_EditorMenu
         if (font != null) textComp.font = font;
 
         textComp.fontSize = 12;
-        textComp.alignment = TextAnchor.MiddleLeft;
+        textComp.alignment = TextAnchor.MiddleCenter;
         textComp.color = Color.white;
         textComp.horizontalOverflow = HorizontalWrapMode.Wrap;
         textComp.verticalOverflow = VerticalWrapMode.Overflow;

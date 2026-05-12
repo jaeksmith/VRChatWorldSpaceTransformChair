@@ -106,8 +106,12 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     [Tooltip("Optional in-world UI Text that will display current eye height + scale ratio. Wire to a world-space Canvas's Text element. Updated every frame while seated. Leave null to disable.")]
     public UnityEngine.UI.Text scaleDisplayText;
 
-    [Tooltip("Optional Transform of a HUD panel (e.g. the scale-display Canvas). If wired, the script auto-scales its localScale by the current avatar-scale ratio so the panel stays roughly apparent-constant in the player's view as they scale.")]
+    [Tooltip("Optional Transform of a HUD panel (e.g. the scale-display Canvas). If wired, the script auto-scales its localScale AND localPosition by the current avatar-scale ratio so the panel stays apparent-constant in the player's view as they scale — same apparent size, same apparent eye-relative position. Without the position scaling, a baseline panel at chair-local (0, 1.4, 0.7) ends up far overhead at small scales and pressed into the face at large scales.")]
     public Transform scaleDisplayPanelTransform;
+
+    [Header("Exit behavior")]
+    [Tooltip("If true (default), the avatar's eye height is restored to its on-entry value when the player exits the chair. If false, the avatar keeps whatever size it had at exit — useful for testing whether scale-related dislocation / body-bork issues persist across re-entries (exit at scale X, re-enter to start with X as the new baseline). SetManualAvatarScalingAllowed(true) and the saved radial-puppet bounds are restored regardless.")]
+    public bool restoreAvatarHeightOnExit = true;
 
     [Header("Multiplayer sync")]
     [Tooltip("Maximum RequestSerialization rate (per second) while the chair is moving. Owner-side throttle; remote viewers lerp between received values for visual smoothness. ~10 is fine for typical use; raise for snappier remote rendering at the cost of bandwidth.")]
@@ -174,9 +178,22 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     private float _savedPlayerMaxHeight;
     private bool _playerBoundsWidened;
 
-    // HUD panel auto-scale base (captured once at start).
+    // HUD panel auto-scale + auto-position base (captured once at start). Both are scaled
+    // by the per-frame avatar ratio so the panel stays in the same eye-relative spot in the
+    // player's view across the full scale range.
     private Vector3 _hudPanelBaseScale;
+    private Vector3 _hudPanelBasePosition;
     private bool _hudPanelBaseCaptured;
+
+    // Last value we passed to SetAvatarEyeHeightByMeters this seated session. The setter has
+    // no documented rate limit but it IS the API surface that drives cross-client scale sync
+    // via VRChat's standard player networking (the radial-puppet bound setters and
+    // SetManualAvatarScalingAllowed are local-only client state, no broadcast). To avoid
+    // redundant network/event traffic, only call the setter when the target actually
+    // differs from the last value we set. VR grip noise generally produces a fresh value
+    // each frame during an active two-hand grip, so the gate is mostly meaningful for "held
+    // perfectly still" / clamped frames, but free either way.
+    private float _lastSetEyeHeight;
 
     // Sync state — only meaningful on the owner.
     private Vector3 _lastSerializedPos;
@@ -192,6 +209,7 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         if (scaleDisplayPanelTransform != null)
         {
             _hudPanelBaseScale = scaleDisplayPanelTransform.localScale;
+            _hudPanelBasePosition = scaleDisplayPanelTransform.localPosition;
             _hudPanelBaseCaptured = true;
         }
 
@@ -267,6 +285,7 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         _anchoredRight = false;
 
         _baselineEyeHeight = _localPlayer.GetAvatarEyeHeightAsMeters();
+        _lastSetEyeHeight = _baselineEyeHeight; // matches current; first SolveTwoHand frame at ratio≈1 will skip the redundant set
 
         // Stop the user's radial-puppet scale from fighting the script while they're seated.
         _localPlayer.SetManualAvatarScalingAllowed(false);
@@ -325,7 +344,11 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
         if (_localPlayer != null && _baselineEyeHeight > 0f)
         {
-            _localPlayer.SetAvatarEyeHeightByMeters(_baselineEyeHeight);
+            if (restoreAvatarHeightOnExit)
+            {
+                _localPlayer.SetAvatarEyeHeightByMeters(_baselineEyeHeight);
+                _lastSetEyeHeight = _baselineEyeHeight;
+            }
             _localPlayer.SetManualAvatarScalingAllowed(true);
 
             // Restore the player's eye-height bounds we widened on entry.
@@ -357,6 +380,7 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         if (_anchoredLeft || _anchoredRight) return;
         if (_localPlayer == null) _localPlayer = player;
         _baselineEyeHeight = _localPlayer.GetAvatarEyeHeightAsMeters();
+        _lastSetEyeHeight = _baselineEyeHeight; // keep the redundant-call gate in sync after avatar swap / external scale change
     }
 
     private void Update()
@@ -369,24 +393,53 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
             if (scaleDisplayText != null)
             {
-                // 4-line readout. Each line answers a question the user is likely asking:
-                //   "How tall is my avatar right now?"      -> Eye height
-                //   "What was I when I sat down?"           -> Baseline (entry)
-                //   "How small/big am I vs entry?"          -> Scale ratio
-                //   "What's the script's allowed range?"    -> Clamp + source
+                // Multi-line readout. Each line answers a question the user is likely asking:
+                //   "What did we last pass to SetEyeHeight?" -> Target (the *requested* value;
+                //                                              compare to Eye height to spot
+                //                                              VRChat silently clamping our calls)
+                //   "How tall is my avatar right now?"       -> Eye height (the *applied* value)
+                //   "What was I when I sat down?"            -> Baseline (entry)
+                //   "How small/big am I vs entry?"           -> Scale ratio
+                //   "What's the script's allowed range?"     -> Clamp + source
+                //   "Has the avatar drifted from the seat?"  -> Offset (player world pos vs
+                //                                               station enter location)
+                // Target on top — when diagnosing scaling issues, the first thing you want
+                // to see is "what did we just ask the API to do" vs "what did the API
+                // actually apply." A persistent gap between Target and Eye height means
+                // VRChat / AvatarScalingSettings / something is overriding our calls.
                 string clampSource = _clampFromWorld ? "AvatarScalingSettings" : "minScale*baseline (fallback)";
+                string offsetLine;
+                if (station != null && station.stationEnterPlayerLocation != null)
+                {
+                    Vector3 playerPos = _localPlayer.GetPosition();
+                    Vector3 entryPos = station.stationEnterPlayerLocation.position;
+                    Vector3 delta = playerPos - entryPos;
+                    offsetLine = "Offset: " + delta.magnitude.ToString("F3") + " m  (" +
+                                 delta.x.ToString("F2") + ", " + delta.y.ToString("F2") + ", " + delta.z.ToString("F2") + ")";
+                }
+                else
+                {
+                    offsetLine = "Offset: (no station / entry location wired)";
+                }
                 scaleDisplayText.text =
+                    "Target: " + _lastSetEyeHeight.ToString("F3") + " m  (last set)\n" +
                     "Eye height: " + current.ToString("F3") + " m\n" +
-                    "Baseline:   " + _baselineEyeHeight.ToString("F3") + " m  (entry)\n" +
-                    "Ratio:      " + ratio.ToString("F3") + "x\n" +
+                    "Baseline: " + _baselineEyeHeight.ToString("F3") + " m  (entry)\n" +
+                    "Ratio: " + ratio.ToString("F3") + "x\n" +
                     "Clamp: [" + _effectiveMinEyeHeight.ToString("F3") + ", " + _effectiveMaxEyeHeight.ToString("F3") + "] m\n" +
-                    "  source: " + clampSource;
+                    "  source: " + clampSource + "\n" +
+                    offsetLine;
             }
 
-            // Auto-scale the HUD panel to keep apparent size roughly constant across player scale.
+            // Auto-scale the HUD panel to keep apparent size AND eye-relative position
+            // roughly constant across player scale. Without the localPosition scaling, the
+            // panel ends up too high overhead at small scales and too close to face at
+            // large scales — because its base local position is sized for baseline eye
+            // height, not for the current scaled avatar.
             if (scaleDisplayPanelTransform != null && _hudPanelBaseCaptured)
             {
                 scaleDisplayPanelTransform.localScale = _hudPanelBaseScale * ratio;
+                scaleDisplayPanelTransform.localPosition = _hudPanelBasePosition * ratio;
             }
         }
         else if (scaleDisplayText != null)
@@ -509,6 +562,7 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         _anchorAxisN = (_anchorDist > 1e-5f) ? (axis / _anchorDist) : Vector3.right;
 
         _eyeHeightAtGrip = _localPlayer.GetAvatarEyeHeightAsMeters();
+        _lastSetEyeHeight = _eyeHeightAtGrip; // first solve frame at scaleFactor≈1 will skip the redundant set
 
         // Prime the EMA filters at the raw current values so the first solver frame doesn't
         // lerp from stale state.
@@ -600,6 +654,18 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
             chairTransform.SetPositionAndRotation(newPos, newRot);
         }
 
-        _localPlayer.SetAvatarEyeHeightByMeters(eyeHeightTarget);
+        // Skip the call if the value didn't change. SetAvatarEyeHeightByMeters drives the
+        // cross-client scale sync via VRChat's player networking; firing it every frame with
+        // an identical value is needless traffic + needless OnAvatarEyeHeightChanged events.
+        // Exact float compare is fine here — the clamp / scaleFactor math is deterministic,
+        // so identical hand poses produce identical eyeHeightTarget values bit-for-bit. VR
+        // grip noise during active gripping generally produces a fresh value each frame
+        // anyway; the gate primarily skips frames when the value lands exactly on a clamp
+        // boundary or when hands are held perfectly still.
+        if (eyeHeightTarget != _lastSetEyeHeight)
+        {
+            _localPlayer.SetAvatarEyeHeightByMeters(eyeHeightTarget);
+            _lastSetEyeHeight = eyeHeightTarget;
+        }
     }
 }

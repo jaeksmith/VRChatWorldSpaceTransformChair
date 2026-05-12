@@ -1,5 +1,9 @@
 # v2 hand-off — non-chair (no-station) version
 
+> **VERDICT (post-investigation): NON-VIABLE.** The body of this doc is preserved for context, but the design it proposes does not work. `TeleportTo` silently clamps the Quaternion rotation argument to yaw (Y-axis heading) only — pitch and roll are dropped. Empirically verified by a one-shot test (per-frame `TeleportTo(GetPosition(), Quaternion.Euler(0, 0, 130), …)` while Immobilized: player stayed upright, facing forward, no roll). VRChat keeps standing players upright as a design rule and there's no API to override that. The implementation built per this doc compiled and ran but felt wobbly — root cause was the per-frame solver computing position offsets assuming full 3D rotation would land, while only yaw actually landed; the mismatch visible as `(R − yaw(R)) · roomScaleHandOffset` lever-arm wobble (~10cm/frame for a few degrees of incidental hand pitch/roll on a 1.4m foot-to-hand lever). The implementation was deleted. The `vrchat-udonsharp` skill's TeleportTo entry was updated with this finding so future threads on any project skip the dead end.
+>
+> **What to use instead:** the chair version (`VRCStation`-driven). The chair gets full 3D rotation because the station tilts the playspace in 3D. Trade-off acknowledged in the body below — multiplayer position sync — remains a real architectural cost of the chair path; addressing it requires manually networking the chair transform. That work is its own milestone, not a v2-replacement task.
+>
 > Read this if you're the next Claude thread starting work on the no-station variant.
 > The chair version is committed and working. Don't touch it.
 
