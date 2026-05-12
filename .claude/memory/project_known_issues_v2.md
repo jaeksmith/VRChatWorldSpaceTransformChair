@@ -6,56 +6,54 @@ originSessionId: d6951207-22e8-4061-8690-43e2cf33b087
 ---
 After v2 multiplayer sync landed (commit `965981e` / fixup `3c0730c`, verified 2026-05-10), the user reported four open issues in Build & Test. Captured here so future threads can pick up without re-asking.
 
-## 1. Scale-display updates slowly (the "first issue")
+## 1. Scale-display updates slowly — DIAGNOSED 2026-05-11: VRChat-side cross-client scale sync (not script)
 
-**Symptom:** "Scale updates only ever so often — maybe 3 to 5 seconds — unsure." Not yet diagnosed which surface is lagging.
+**Symptom (original):** "Scale updates only ever so often — maybe 3 to 5 seconds — unsure."
 
-**Open question for diagnosis:** is the lag in
-- (a) the HUD readout text (the "Eye height / Baseline / Ratio / Clamp" lines on the chair's scale-display panel), or
-- (b) the avatar's visible scale lagging behind the grip-spread motion, or
-- (c) the *remote* avatar's scale lagging on a watching client (different code path — VRChat's player-eye-height sync rate, not our script)?
+**RESOLUTION (verified 2026-05-11):** The lag was on the REMOTE client side — VRChat's standard player networking sync rate for cross-client avatar scale, which we do not drive and cannot control. `SetAvatarEyeHeightByMeters` only sets the local player's scale; cross-client visibility goes through VRChat's player sync channel (not our UdonSynced channel). The local HUD reads `GetAvatarEyeHeightAsMeters()` each frame and is live.
 
-Investigation should ask the user which surface they're seeing before chasing root causes.
+**Hygiene fix landed:** Added a value-different gate on `SetAvatarEyeHeightByMeters` in `SolveTwoHand` so we don't fire the setter (and the `OnAvatarEyeHeightChanged` event) when the value didn't change. Doesn't affect remote lag — VRChat owns that — but avoids needless local event traffic. The radial-puppet bound setters and `SetManualAvatarScalingAllowed` are local-only client state, no broadcast.
 
-**Why:** Both surfaces exist and have different update paths. Diagnosing without confirming surface wastes a round.
+**Status:** Closed-as-VRChat-limitation. Document the cross-client lag in the README if/when the component ships publicly.
 
-**How to apply:** Resume this issue first. Ask the user which surface is lagging if it's not clear from the convo. Then likely causes per surface:
-- HUD: check `Update()` is actually running each frame for the local owner (not gated out by `_isSeatedLocal` flipping); check `Text.text` writes aren't being missed.
-- Local avatar scale: check `SetAvatarEyeHeightByMeters` is being called every frame in `SolveTwoHand` and not throttled by `OnAvatarEyeHeightChanged` re-baselining.
-- Remote scale: VRChat's standard player-sync rate is what it is — limited control. May just be the rate. Document and move on if so.
+## 2. HUD panel doesn't track player scale / distance correctly — FIXED 2026-05-11
 
-## 2. HUD panel doesn't track player scale / distance correctly
+**Symptom (original):** The scale-display panel doesn't visually scale and reposition with the player's avatar scale, so when the player grows / shrinks the panel ends up wrong size / wrong distance ("pressed against face at large scale, floating overhead at small scale").
 
-**Symptom:** The scale-display panel doesn't visually scale and reposition with the player's avatar scale, so when the player grows / shrinks the panel ends up wrong size / wrong distance.
+**RESOLUTION (2026-05-11):** `Update()` now scales BOTH `localScale` AND `localPosition` by ratio (was only `localScale` before). Captured `_hudPanelBasePosition` alongside the existing `_hudPanelBaseScale` at `Start`. Treats the panel as a geometrically-similar transform around the chair root — so as the avatar shrinks, the panel moves closer to (and stays at the right eye-relative height of) the smaller player. User confirms: "better, but not quite perfect — livable."
 
-**Context:** The current `Update()` in the chair sets `scaleDisplayPanelTransform.localScale = _hudPanelBaseScale * ratio` to keep it apparent-constant. That handles scale but may not handle distance — if the panel is parented to the chair root and the player shrinks, the panel stays at the same world position (correct in world space) but appears tiny/far in the player's view because the player's eyes are now closer to the floor.
+**Related polish landed same session:**
+- Panel widened 1.7x (100→170) and slightly taller (90→110) to fit the added diagnostic lines (Target, Offset).
+- Text alignment changed from `MiddleLeft` to `MiddleCenter` per user preference.
+- Both editor menu and the dev scene's existing panel were updated; editor menu sizing comment also updated.
+- New Target line (top of readout) shows the value we last passed to `SetAvatarEyeHeightByMeters` so divergence from `Eye height:` is visible at a glance.
+- New Offset line (bottom) shows `_localPlayer.GetPosition() - station.stationEnterPlayerLocation.position` for diagnosing the "body knocked out of seat" symptom.
 
-**Why:** HUD is a development-debug aid. The user has flagged it will likely be removed or made optional in the released component; full polish is not required, just enough that it doesn't get in the way during dev.
+**Status:** Closed. May revisit if "not quite perfect" turns into a specific complaint later.
 
-**How to apply:** Low priority unless it's blocking debugging. If addressed, consider:
-- Parenting the panel to a head-following empty transform instead of the chair root.
-- Or scaling the panel by `ratio^2` or similar to compensate for both the eye-height shift and the apparent-distance shift.
-- Or accepting that the debug HUD looks rough at extreme scales and moving on.
+## 3. Avatar scales away from player at a crossover scale point — DIAGNOSED 2026-05-11: per-avatar IK quality
 
-## 3. Avatar scales away from player at a crossover scale point
+**Symptom (original report):** "The case where the avatar appears to scale away from the player — this seems to occur at the same scaling crossover scale point."
 
-**Symptom:** "The case where the avatar appears to scale away from the player — this seems to occur at the same scaling crossover scale point."
+**Symptom (refined 2026-05-11):** With Build & Test's default test avatar (the standard robot), the shift triggers at ratio ~0.8 (very mild scale-down). The user discovered the shift threshold also varies with hand height — belly-height hands hit it at ~0.5, lower hands sooner, higher hands later — and described it as "feels like my hand hitting something." Hypothesis at the time: avatar IK strain when real-world hand position is far from the shrunken avatar's natural reach.
 
-**Context:** Discussed in prior sessions but never fully diagnosed. The "crossover scale point" suggests a specific eye-height threshold where VRChat's avatar IK / mesh rendering breaks coherence — the visual avatar detaches from the player's actual position/scale. The skill's "Avatar scaling APIs split into Player-Controlled vs World-Authoritative" entry notes that outside the ~`[0.1m, 100m]` "safe" rendering range, "avatar mesh visually plateaus, IK breaks." Likely the same phenomenon, but the specific threshold the user is hitting hasn't been measured.
+**RESOLUTION (verified 2026-05-11):** Uploaded a regular humanoid avatar and tried the same scaling. The avatar handles down to ratio 0.1 cleanly (VRChat's standard "things might not work well beyond this point" warning fires at that point, mild torso drift forward, hands still tracked correctly). **The earlier threshold-at-0.8 was the Build & Test default avatar's IK breaking, not anything in our script or VRChat at the API level.**
 
-**Why:** This is a VRChat / avatar IK behavior, not a script bug. Workarounds (clamp to safe range, swap mesh-only avatars at extreme scales, etc.) are world-level concerns.
+**Implication:** Per-avatar IK quality dominates the "safe scaling range" — the documented [0.1m, 100m] range is a rough guide, but the actual usable range for a given avatar can be much narrower (the test robot's was ~[0.8, ~5]) or much wider (regular avatars are at least [0.1, ~5+]). The script's defaults of `minScale=0.1, maxScale=10` are reasonable for production avatars; the chair can't fix a poorly-rigged avatar.
 
-**How to apply:** If asked to investigate: measure the crossover eye-height empirically in Build & Test, compare to the avatar's `AvatarScalingSettings` clamp and to the skill's documented "safe range," and decide whether to tighten the chair's `minScale` / `maxScale` defaults to keep users inside the coherent zone. Don't expect to fix VRChat's IK.
+**How to apply:** If a user reports avatar-detachment at moderate scales, FIRST ask what avatar they're testing in — if it's the Build & Test default test avatar, ask them to retry with a real uploaded avatar. The behavior is most likely avatar-IK, not script. (Skill entry added: "Avatar IK quality dominates the 'safe scaling range' — Build & Test's default avatar is unusually bad.")
 
-## 4. Body "borks" at large scales — appears displaced from seat as if colliding
+## 4. Body "borks" at large scales — DIAGNOSED 2026-05-11: avatar feet larger than floor square at extreme upscales
 
-**Symptom:** "The body seems to bork as if hitting something and being moved to a position not the same as the player — almost like a collision force out of body. Depends on how much one scaled — get really big, then the body borks position at a larger scale."
+**Symptom (original):** "The body seems to bork as if hitting something and being moved to a position not the same as the player — almost like a collision force out of body. Depends on how much one scaled — get really big, then the body borks position at a larger scale."
 
-**Context:** Scaled-player collision interaction with world geometry. When the avatar is large, its collision capsule is correspondingly large; if the chair has translated the player into geometry that the small-scale avatar would have cleared, the physics layer pushes the avatar out, displacing it from the station seat. This is the inverse of issue 3 in some sense (3 is rendering; 4 is physics).
+**RESOLUTION (verified 2026-05-11, regular avatar):** The bork at moderate upscales was the same avatar-IK issue as #3 (test avatar in Build & Test). At GENUINELY gigantic scales (multiple multiples of baseline), the user still gets knocked out of the chair — but the user observed plausibly because their giant avatar's feet were larger than the floor square the chair sits on. Not a script bug; expected behavior of scaled colliders vs. fixed geometry.
 
-**Why:** Scaled colliders against fixed world geometry. May be addressable by tuning `Immobilize` interaction with collision, or by checking if there's an API to disable player-collider influence while seated.
+**Why:** Scaled-player collision interaction with world geometry. When the avatar is huge, its collision capsule is huge; intrudes into floor/world geometry; VRChat physics pushes the avatar (and, by extension, the seated position) out of the seat. Setting the chair hierarchy to Walkthrough layer didn't help, per 2026-05-11 testing — which suggests the collision is at the WORLD geometry layer (floor, walls), not the chair's own colliders.
 
-**How to apply:** Likely related to the `VRCStation` player-collider behavior. Worth checking SDK docs for whether seated players have collision overridden, and whether scaling the eye height correspondingly scales the collider. Empirical test: scale up gradually in an open area vs. near a wall and see if the bork only triggers near geometry. If geometry-triggered, the workaround is "don't translate seated players into walls" — a design constraint, not a script fix.
+**How to apply:** Document the bound as a known limit. Tightening `maxScale` to keep the avatar's feet inside whatever world floor area the chair sits in is a per-world tuning concern. The chair component can't generically fix this — the world author decides how big the floor is.
+
+**Status:** Closed-as-expected. May re-open if the user finds the bork happens at scales where the floor IS big enough.
 
 ## Cross-references
 
