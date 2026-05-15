@@ -127,6 +127,22 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     [Range(0.05f, 1f)]
     public float remoteLerp = 0.2f;
 
+    [Header("Callbacks (public VrcWorldTx__ API)")]
+    [Tooltip("Optional UdonBehaviour that will receive callback events. Fires LOCAL-ONLY on the acting (seated) player's machine, post-work. Methods looked up by name on the target (silent no-op when missing, per VRChat's SendCustomEvent semantics):\n  VrcWorldTx__Entered(), VrcWorldTx__Exited(), VrcWorldTx__TxChanged()\nBefore each SendCustomEvent the chair writes Param__ fields onto the target (see README API section for the table). The receiver opts into the optional TxChanged event via a bool field VrcWorldTx__Config__IncludeTxChangedCalls — read once on station entry (cached for the seated duration). Leave null to disable callbacks entirely.")]
+    public UdonBehaviour callbackTarget;
+
+    [Tooltip("Minimum interval between consecutive VrcWorldTx__TxChanged fires (seconds). Caps callback frequency for high-rate grip motion. Set to 0 to fire as soon as any per-frame change exceeds the epsilons below.")]
+    public float txChangedMinInterval = 0.1f;
+
+    [Tooltip("Position-change threshold (meters) below which TxChanged will NOT fire — change-only contract. ~0.001 = 1mm.")]
+    public float txChangedPosEpsilon = 0.001f;
+
+    [Tooltip("Rotation-change threshold (degrees) below which TxChanged will NOT fire — change-only contract.")]
+    public float txChangedRotEpsilon = 0.1f;
+
+    [Tooltip("Eye-height-change threshold (meters) below which TxChanged will NOT fire — change-only contract.")]
+    public float txChangedEyeHeightEpsilon = 0.001f;
+
     [Header("Per-player layout")]
     [Tooltip("X-axis spawn offset per player ID, in meters. When this script is on a VRCPlayerObject template, all per-player copies spawn at the same template position; offsetting by playerId * this value spreads chairs along X so click-targets and visuals don't overlap. Computed deterministically on every client (no sync). Set to 0 if your world places chairs explicitly via some other mechanism.")]
     public float perPlayerXSpacing = 1.5f;
@@ -203,6 +219,22 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
     // Per-player offset is applied once per instance (every client computes the same
     // value from owner.playerId, so this is local-only state).
     private bool _perPlayerOffsetApplied;
+
+    // Callback bookkeeping. Resolved on station enter, cleared on exit. All callback
+    // bookkeeping is LOCAL to the acting player — remote viewers never fire callbacks
+    // (cross-client propagation is the consumer's responsibility per the API contract).
+    //   `_callbackHasTarget` snapshots `callbackTarget != null` once on enter so a runtime
+    //     Inspector unwire mid-session doesn't suddenly throw inside the firing path.
+    //   `_callbackIncludeTxChanged` reads the receiver's Config flag once on enter so the
+    //     per-frame TxChanged path doesn't pay a GetProgramVariable hit every frame, and
+    //     so toggling the flag mid-session has well-defined "applies from next entry" semantics.
+    //   `_lastFiredTx*` + `_lastTxFireTime` drive the change-only + min-interval gating.
+    private bool _callbackHasTarget;
+    private bool _callbackIncludeTxChanged;
+    private Vector3 _lastFiredTxPos;
+    private Quaternion _lastFiredTxRot;
+    private float _lastFiredTxEyeHeight;
+    private float _lastTxFireTime;
 
     private void Start()
     {
@@ -330,6 +362,36 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
             _effectiveMinEyeHeight = _baselineEyeHeight * minScale;
             _effectiveMaxEyeHeight = _baselineEyeHeight * maxScale;
         }
+
+        // Callback resolution for the seated session. Snapshot the wired-ness of the target
+        // once so a runtime Inspector unwire mid-session doesn't break the firing path, and
+        // read the receiver's TxChanged opt-in flag once so we don't pay a GetProgramVariable
+        // hit per frame. Reading absent / non-bool returns false implicitly via the default-bool
+        // fallthrough — receivers without the flag don't get TxChanged callbacks.
+        _callbackHasTarget = (callbackTarget != null);
+        _callbackIncludeTxChanged = false;
+        if (_callbackHasTarget)
+        {
+            object flag = callbackTarget.GetProgramVariable("VrcWorldTx__Config__IncludeTxChangedCalls");
+            if (flag != null) _callbackIncludeTxChanged = (bool)flag;
+        }
+
+        // Seed the TxChanged change-detect baseline at current state so the first material
+        // change after entry fires, but a no-op enter (avatar lands at the seat unchanged)
+        // does not. _lastTxFireTime stays at 0 so the min-interval gate is satisfied for
+        // the first fire (Time.time has long since passed 0 by the time anyone is seated).
+        if (chairTransform != null)
+        {
+            _lastFiredTxPos = chairTransform.position;
+            _lastFiredTxRot = chairTransform.rotation;
+        }
+        _lastFiredTxEyeHeight = _baselineEyeHeight;
+        _lastTxFireTime = 0f;
+
+        // Post-work fire of Entered. After this point all session state is set up
+        // (clamps, manual-scaling lock, callback caches) so the receiver sees a fully
+        // initialised chair if it calls back into us.
+        FireCallback_Entered();
     }
 
     public override void OnStationExited(VRCPlayerApi player)
@@ -362,6 +424,13 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
 
         // Re-enable the Interact zone so the chair is clickable again.
         if (interactCollider != null) interactCollider.enabled = true;
+
+        // Post-work fire of Exited. Done AFTER avatar height / scaling-allowed / bounds /
+        // interact-collider have all been restored, so receivers observing the chair from
+        // their callback see a fully-quiesced state.
+        FireCallback_Exited();
+        _callbackHasTarget = false;
+        _callbackIncludeTxChanged = false;
     }
 
     public override void InputGrab(bool value, UdonInputEventArgs args)
@@ -497,6 +566,14 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
         // After the solver may have mutated chairTransform, push the new pose out via
         // UdonSynced if it actually changed. Motion-gated + rate-throttled — see TrySerialize.
         TrySerialize();
+
+        // Post-work TxChanged fire. Runs only on the local seated player (callbacks are
+        // local-only per the API contract — remote viewers' lerping doesn't count as a
+        // "transform change" we own). Change-only + min-interval gated inside.
+        if (_isSeatedLocal)
+        {
+            TryFireCallback_TxChanged();
+        }
     }
 
     // Apply a one-time per-player X offset to the root transform. Computed deterministically
@@ -667,5 +744,101 @@ public class VRChatWorldSpaceTransformChair : UdonSharpBehaviour
             _localPlayer.SetAvatarEyeHeightByMeters(eyeHeightTarget);
             _lastSetEyeHeight = eyeHeightTarget;
         }
+    }
+
+    // ---- Callback dispatch (public VrcWorldTx__ API; see project_api_conventions.md) ----
+    //
+    // Wire chair-internal events to a single optional receiver UdonBehaviour. All three helpers:
+    //   - early-out when there's no wired target (snapshotted on enter; immune to runtime unwire)
+    //   - set Param__ fields on the target via SetProgramVariable BEFORE SendCustomEvent (Udon
+    //     can't pass args through SendCustomEvent, so field-set-then-send is the only path)
+    //   - rely on SendCustomEvent's silent-no-op-on-missing-method semantics — receivers that
+    //     don't implement an event just see it dropped, no error
+    //
+    // SendCustomEvent dispatches synchronously on this client only — that's the local-only
+    // firing contract. Cross-client propagation is the consumer's job if they need it.
+
+    // Entered carries the same 7 Param fields as TxChanged. Initial pose + eye-height
+    // are both already captured by the time we fire (chairTransform.position/.rotation
+    // is stable from prior session / scene init / sync, and _baselineEyeHeight was just
+    // assigned a few lines up in OnStationEntered). To keep the "all Old + New set every
+    // call" rule of the spec, we set Old = New = entry-state — the receiver sees a zero
+    // delta and can diff coherently against the first TxChanged that follows. This also
+    // overwrites any stale Old values left by a prior session on the same receiver.
+    private void FireCallback_Entered()
+    {
+        if (!_callbackHasTarget) return;
+        Vector3 entryPos = (chairTransform != null) ? chairTransform.position : Vector3.zero;
+        Quaternion entryRot = (chairTransform != null) ? chairTransform.rotation : Quaternion.identity;
+        float entryEh = _baselineEyeHeight;
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__SourceStation", this);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldPos", entryPos);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldRot", entryRot);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldEyeHeight", entryEh);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewPos", entryPos);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewRot", entryRot);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewEyeHeight", entryEh);
+        callbackTarget.SendCustomEvent("VrcWorldTx__Entered");
+    }
+
+    // Exited deliberately carries ONLY SourceStation. Pose and eye-height would be
+    // misleading or partial:
+    //   - Chair pose at exit ≠ player's pose after exit (VRChat repositions the player
+    //     to the station's exit transform). Reporting chair pose as "where the character
+    //     is now" would mislead consumers.
+    //   - Eye-height post-restore matches the character (when restoreAvatarHeightOnExit
+    //     is true), but covering eye-height-only and not pose is asymmetric — worse than
+    //     covering nothing here. Receivers that need a post-exit eye-height can read it
+    //     directly via Networking.LocalPlayer.GetAvatarEyeHeightAsMeters().
+    private void FireCallback_Exited()
+    {
+        if (!_callbackHasTarget) return;
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__SourceStation", this);
+        callbackTarget.SendCustomEvent("VrcWorldTx__Exited");
+    }
+
+    // Change-only + min-interval gated. The change check uses chairTransform pose for pos/rot
+    // (the externally observable chair surface, matching what's [UdonSynced]) and the player's
+    // current eye height in meters for size. Any one of (pos, rot, eye-height) exceeding its
+    // epsilon since the last fire triggers a fire that sets all seven Param fields — receivers
+    // can cheaply diff old vs new on the axis they care about.
+    private void TryFireCallback_TxChanged()
+    {
+        if (!_callbackHasTarget) return;
+        if (!_callbackIncludeTxChanged) return;
+        if (chairTransform == null || _localPlayer == null) return;
+
+        // Min-interval gate first — cheaper than fetching pose + eye-height when we're
+        // throttle-blocked. Set txChangedMinInterval to 0 to disable.
+        float now = Time.time;
+        if (txChangedMinInterval > 0f && (now - _lastTxFireTime) < txChangedMinInterval) return;
+
+        Vector3 newPos = chairTransform.position;
+        Quaternion newRot = chairTransform.rotation;
+        float newEyeHeight = _localPlayer.GetAvatarEyeHeightAsMeters();
+
+        float posDelta = (newPos - _lastFiredTxPos).magnitude;
+        float rotDelta = Quaternion.Angle(newRot, _lastFiredTxRot);
+        float ehDelta = Mathf.Abs(newEyeHeight - _lastFiredTxEyeHeight);
+
+        bool posChanged = posDelta > txChangedPosEpsilon;
+        bool rotChanged = rotDelta > txChangedRotEpsilon;
+        bool ehChanged = ehDelta > txChangedEyeHeightEpsilon;
+        if (!posChanged && !rotChanged && !ehChanged) return;
+
+        // All seven param fields set every fire; receivers diff cheaply on the axis they care.
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__SourceStation", this);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldPos", _lastFiredTxPos);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldRot", _lastFiredTxRot);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__OldEyeHeight", _lastFiredTxEyeHeight);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewPos", newPos);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewRot", newRot);
+        callbackTarget.SetProgramVariable("VrcWorldTx__Param__NewEyeHeight", newEyeHeight);
+        callbackTarget.SendCustomEvent("VrcWorldTx__TxChanged");
+
+        _lastFiredTxPos = newPos;
+        _lastFiredTxRot = newRot;
+        _lastFiredTxEyeHeight = newEyeHeight;
+        _lastTxFireTime = now;
     }
 }

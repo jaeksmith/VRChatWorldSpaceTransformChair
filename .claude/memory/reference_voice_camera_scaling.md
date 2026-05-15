@@ -75,4 +75,20 @@ There's no clean fix. Workarounds the world author can consider:
 
 ## Status
 
-**Not yet implemented.** Research only. User intends to mod/test in a following session.
+**Not yet implemented.** Research-and-plan stage. Implementation thread sequenced after callback scaffold per `project_roadmap.md`.
+
+## Planned implementation (decided 2026-05-12 in planning thread)
+
+Three modes exposed as an Inspector enum on the chair:
+
+- **`Off`** — chair never touches voice settings.
+- **`DistanceBased`** — chair scales `SetVoiceDistanceFar` (and optionally Near / VolumetricRadius) with the seated player's avatar scale ratio, using the per-client polling pattern in section 1 above. Voice logic reads scale directly inside the chair — it does NOT subscribe to the chair's own `VrcWorldTx__TxChanged` callback (callbacks are external-consumer API only; see `project_api_conventions.md`).
+- **`SwitchToGlobal`** — chair switches the seated player to a "globally audible" voice config (effectively very large far distance + appropriate gain) on enter, restores on exit.
+
+**Restore on exit is required**, symmetric to the existing `restoreAvatarHeightOnExit` config. The restore path lives in `OnStationExited` (or whatever single chokepoint already handles avatar-height restore) so all exit routes — chair API exit, station Jump-exit, menu Respawn-triggered station exit — converge on one code path.
+
+**Cross-client gotcha still applies**: per section 1, voice settings are per-client-per-player. The chair's mode-switching logic has to run on EVERY client, not just the seated player's, to keep the seated player audible to others correctly. Late-join handling: when a new player joins while someone is seated, the new client must apply the same voice mods to that seated player.
+
+**Min/max clamps**: TBD at implementation. The ratio-clamping discussion in section 1 still stands (ratio=0.01 effectively mutes; ratio=100 broadcasts to 2.5km). Default clamps should be sane production values.
+
+**Public API mirroring**: voice mode + restore-on-exit flag follow the project naming convention in `project_api_conventions.md` (e.g. Inspector fields named per project style, any new callbacks named `VrcWorldTx__*`).
